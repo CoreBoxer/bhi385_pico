@@ -5,11 +5,13 @@
 #include "verbose.h"
 
 #include "bhi385.h"
+#include "bhi385_defs.h"
 #include "bhi385_parse.h"
 #include "bhi385_event_data.h"
 #include "bhi385_virtual_sensor_conf_param.h"
 
-#include "firmware/bhi385/Bosch_Shuttle3_BHI385_bsxsam_lite.fw.h"
+/* 关键改动：换成带 BMP58X 驱动的固件，否则气压/温度虚拟传感器不会被枚举出来 */
+#include "firmware/bhi385/Bosch_Shuttle3_BHI385_BMP58X_bsxsam.fw.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -19,12 +21,14 @@
 #define BHI385_ADDR_0              UINT8_C(0x28)
 #define BHI385_ADDR_1              UINT8_C(0x29)
 
-// 先保守一点：保证在不同 Arduino/Wire 实现下都尽量不踩 buffer 限制
 #define BHI385_RD_WR_LEN           UINT32_C(32)
 
 #define WORK_BUFFER_SIZE           UINT32_C(2048)
 #define BOOT_READY_TIMEOUT_MS      UINT32_C(1000)
 #define BOOT_POLL_INTERVAL_MS      UINT32_C(10)
+
+#define BHI385_BST_FW_VERIFY_DONE   (1 << 5)
+#define BHI385_BST_FW_VERIFY_ERROR  (1 << 6)
 
 static struct bhi385_dev bhy;
 static uint8_t dev_addr = BHI385_ADDR_0;
@@ -34,7 +38,7 @@ static int8_t platform_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t le
 {
     uint8_t addr = *(uint8_t *)intf_ptr;
     int rc = pico_i2c_bridge_read(addr, reg_addr, reg_data, len);
-    return (rc == 0) ? 0 : 1; // 0=OK; 非0=失败 -> API 会映射成 BHI385_E_IO(-3)
+    return (rc == 0) ? 0 : 1;
 }
 
 static int8_t platform_i2c_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t len, void *intf_ptr)
@@ -50,11 +54,12 @@ static void platform_delay_us(uint32_t period_us, void *intf_ptr)
     pico_delay_us(period_us);
 }
 
+/* ---------------- 四元数解析（保留，验证固件切换后 bsxsam 仍可用） ---------------- */
 static void parse_quaternion_data(const struct bhi385_fifo_parse_data_info *cb, void *ref)
 {
     (void)ref;
 
-    if (cb->data_size != 11) // 官方例程同样检查 11 bytes（含 sensor id）
+    if (cb->data_size != 11)
     {
         return;
     }
@@ -62,12 +67,11 @@ static void parse_quaternion_data(const struct bhi385_fifo_parse_data_info *cb, 
     struct bhi385_event_data_quaternion q;
     bhi385_event_data_parse_quaternion(cb->data_ptr, &q);
 
-    // 时间戳可选：如果你想和官方输出一致，可打开
     uint32_t s = 0, ns = 0;
     if (cb->time_stamp)
     {
         uint64_t t = *cb->time_stamp;
-        t = t * 15625; // 官方 quaternion.c 做法：tick -> ns
+        t = t * 15625;
         s  = (uint32_t)(t / UINT64_C(1000000000));
         ns = (uint32_t)(t - (uint64_t)s * UINT64_C(1000000000));
     }
@@ -80,6 +84,66 @@ static void parse_quaternion_data(const struct bhi385_fifo_parse_data_info *cb, 
             q.z / 16384.0f,
             q.w / 16384.0f,
             ((q.accuracy * 180.0f) / 16384.0f) / 3.141592653589793f);
+}
+
+/* ---------------- 气压解析：3字节小端数据，缩放因子 1/128（单位 hPa） ---------------- */
+static void parse_bmp_pressure_data(const struct bhi385_fifo_parse_data_info *cb, void *ref)
+{
+    (void)ref;
+
+    if (!cb)
+    {
+        PRINT_E("Pressure: Null reference\r\n");
+        return;
+    }
+
+    const float scaling_factor = 1.0f / 128.0f;
+
+    uint32_t s = 0, ns = 0;
+    if (cb->time_stamp)
+    {
+        uint64_t timestamp = *cb->time_stamp;
+        timestamp = timestamp * 15625;
+        s  = (uint32_t)(timestamp / UINT64_C(1000000000));
+        ns = (uint32_t)(timestamp - (uint64_t)s * UINT64_C(1000000000));
+    }
+
+    uint32_t data = BHI385_LE2U24(cb->data_ptr);
+
+    PRINT_D("SID:%u T:%lu.%09lu Pressure: %f hPa\r\n",
+            cb->sensor_id,
+            (unsigned long)s, (unsigned long)ns,
+            (float)data * scaling_factor);
+}
+
+/* ---------------- 温度解析：同样 3字节小端，缩放因子 1/128（单位 °C） ---------------- */
+static void parse_pressure_temperature_data(const struct bhi385_fifo_parse_data_info *cb, void *ref)
+{
+    (void)ref;
+
+    if (!cb)
+    {
+        PRINT_E("Temperature: Null reference\r\n");
+        return;
+    }
+
+    const float scaling_factor = 1.0f / 128.0f;
+
+    uint32_t s = 0, ns = 0;
+    if (cb->time_stamp)
+    {
+        uint64_t timestamp = *cb->time_stamp;
+        timestamp = timestamp * 15625;
+        s  = (uint32_t)(timestamp / UINT64_C(1000000000));
+        ns = (uint32_t)(timestamp - (uint64_t)s * UINT64_C(1000000000));
+    }
+
+    uint32_t data = BHI385_LE2U24(cb->data_ptr);
+
+    PRINT_D("SID:%u T:%lu.%09lu Temperature: %f C\r\n",
+            cb->sensor_id,
+            (unsigned long)s, (unsigned long)ns,
+            (float)data * scaling_factor);
 }
 
 static int8_t bhi385_wait_host_if_ready(uint32_t timeout_ms, uint8_t *boot_status_out)
@@ -149,10 +213,8 @@ void bhi385_app_init(void)
     uint8_t boot_status = 0;
     uint16_t kernel_ver = 0;
 
-    // 先用更低速确保信号完整性；稳定后再提到 400k/1MHz
     pico_i2c_bridge_init(1000000);
 
-    // 1) 探测地址 + 读 chip id
     rslt = bhi385_probe_and_init(BHI385_ADDR_0);
     if (rslt != BHI385_OK)
     {
@@ -160,11 +222,10 @@ void bhi385_app_init(void)
     }
     if (rslt != BHI385_OK)
     {
-        PRINT_E("BHI385 probe failed (rslt=%d). Check: VDDIO=1.8V + level shift + CS(HCSB) pulled high + wiring.\r\n", rslt);
+        PRINT_E("BHI385 probe failed (rslt=%d).\r\n", rslt);
         return;
     }
 
-    // 2) Soft reset（如果这里 -3，说明“最基本 1byte 写寄存器”都失败）
     rslt = bhi385_soft_reset(&bhy);
     if (rslt != BHI385_OK)
     {
@@ -172,7 +233,6 @@ void bhi385_app_init(void)
         return;
     }
 
-    // 3) 等 Host Interface Ready（datasheet 建议 reset 后 poll 0x25 bit4）<!--citation:3-->
     rslt = bhi385_wait_host_if_ready(BOOT_READY_TIMEOUT_MS, &boot_status);
     if (rslt != BHI385_OK)
     {
@@ -182,7 +242,6 @@ void bhi385_app_init(void)
     }
     PRINT_D("Boot status=0x%02X (Host IF ready)\r\n", boot_status);
 
-    // 4) Host interrupt / interface ctrl（和官方例程一致）<!--citation:2-->
     {
         uint8_t hintr_ctrl = BHI385_ICTL_DISABLE_STATUS_FIFO | BHI385_ICTL_DISABLE_DEBUG;
         rslt = bhi385_set_host_interrupt_ctrl(hintr_ctrl, &bhy);
@@ -192,17 +251,13 @@ void bhi385_app_init(void)
         if (rslt != BHI385_OK) { PRINT_E("set_host_intf_ctrl failed, rslt=%d\r\n", rslt); return; }
     }
 
-    // 5) 上传固件 + boot from RAM
-    PRINT_D("Uploading firmware...\r\n");
+    PRINT_D("Uploading firmware (BMP58X + bsxsam)...\r\n");
     rslt = bhi385_upload_firmware_to_ram(bhi385_firmware_image, sizeof(bhi385_firmware_image), &bhy);
     if (rslt != BHI385_OK)
     {
         PRINT_E("Firmware upload failed, rslt=%d\r\n", rslt);
         return;
     }
-
-    #define BHI385_BST_FW_VERIFY_DONE   (1 << 5)
-    #define BHI385_BST_FW_VERIFY_ERROR  (1 << 6)
 
     uint8_t bs = 0;
     rslt = bhi385_get_boot_status(&bs, &bhy);
@@ -213,12 +268,12 @@ void bhi385_app_init(void)
 
     if (bs & BHI385_BST_FW_VERIFY_ERROR)
     {
-        PRINT_E("Firmware CRC/signature verification FAILED. Check firmware image / upload integrity.\r\n");
+        PRINT_E("Firmware CRC/signature verification FAILED.\r\n");
         return;
     }
     if (!(bs & BHI385_BST_FW_VERIFY_DONE))
     {
-        PRINT_E("Firmware verification not done yet (unexpected after upload returns OK).\r\n");
+        PRINT_E("Firmware verification not done yet.\r\n");
         return;
     }
 
@@ -238,13 +293,14 @@ void bhi385_app_init(void)
     else
     {
         PRINT_E("Kernel version read failed or zero (rslt=%d, ver=%u)\r\n", rslt, kernel_ver);
-        // 这里不直接 return：有时固件起来慢，你也可以再加一次延时+重读
     }
 
-    // 6) 注册回调 + 更新虚拟传感器列表
+    /* 注册回调：系统事件 + 四元数(可选保留) + 气压 + 温度 */
     (void)bhi385_register_fifo_parse_callback(BHI385_SYS_ID_META_EVENT, bhi385_parse_meta_event, NULL, &bhy);
     (void)bhi385_register_fifo_parse_callback(BHI385_SYS_ID_META_EVENT_WU, bhi385_parse_meta_event, NULL, &bhy);
     (void)bhi385_register_fifo_parse_callback(BHI385_SENSOR_ID_GAMERV, parse_quaternion_data, NULL, &bhy);
+    (void)bhi385_register_fifo_parse_callback(BHI385_SENSOR_ID_PRESSURE, parse_bmp_pressure_data, NULL, &bhy);
+    (void)bhi385_register_fifo_parse_callback(BHI385_SENSOR_BMP_TEMPERATURE, parse_pressure_temperature_data, NULL, &bhy);
 
     rslt = bhi385_update_virtual_sensor_list(&bhy);
     if (rslt != BHI385_OK)
@@ -253,20 +309,29 @@ void bhi385_app_init(void)
         return;
     }
 
-    // 7) 使能 Game Rotation Vector（quaternion.c 同款）<!--citation:6-->
     struct bhi385_virtual_sensor_conf_param_conf sensor_conf;
     memset(&sensor_conf, 0, sizeof(sensor_conf));
+
+    /* Game Rotation Vector：如需关闭可删掉这3行以节省带宽/FIFO */
     sensor_conf.sample_rate = 100.0f;
     sensor_conf.latency = 0;
-
     rslt = bhi385_virtual_sensor_conf_param_set_cfg(BHI385_SENSOR_ID_GAMERV, &sensor_conf, &bhy);
-    if (rslt != BHI385_OK)
-    {
-        PRINT_E("virtual_sensor_conf_param_set_cfg failed, rslt=%d\r\n", rslt);
-        return;
-    }
+    if (rslt != BHI385_OK) { PRINT_E("Enable GAMERV failed, rslt=%d\r\n", rslt); }
+    else { PRINT_D("Game Rotation Vector enabled at %.2f Hz\r\n", sensor_conf.sample_rate); }
 
-    PRINT_D("Game Rotation Vector enabled at %.2f Hz\r\n", sensor_conf.sample_rate);
+    /* 气压：BMP58X 通常采样率上限较低，这里用 10Hz 示例，可按需调整 */
+    sensor_conf.sample_rate = 10.0f;
+    sensor_conf.latency = 0;
+    rslt = bhi385_virtual_sensor_conf_param_set_cfg(BHI385_SENSOR_ID_PRESSURE, &sensor_conf, &bhy);
+    if (rslt != BHI385_OK) { PRINT_E("Enable PRESSURE failed, rslt=%d\r\n", rslt); return; }
+    PRINT_D("Pressure enabled at %.2f Hz\r\n", sensor_conf.sample_rate);
+
+    /* 温度：通常跟随气压同一次测量产生，速率可与气压保持一致 */
+    sensor_conf.sample_rate = 10.0f;
+    sensor_conf.latency = 0;
+    rslt = bhi385_virtual_sensor_conf_param_set_cfg(BHI385_SENSOR_BMP_TEMPERATURE, &sensor_conf, &bhy);
+    if (rslt != BHI385_OK) { PRINT_E("Enable BMP_TEMPERATURE failed, rslt=%d\r\n", rslt); return; }
+    PRINT_D("BMP Temperature enabled at %.2f Hz\r\n", sensor_conf.sample_rate);
 }
 
 void bhi385_app_loop(void)
@@ -274,7 +339,6 @@ void bhi385_app_loop(void)
     int8_t rslt = bhi385_get_and_process_fifo(work_buffer, WORK_BUFFER_SIZE, &bhy);
     if (rslt != BHI385_OK)
     {
-        // 不要刷屏，可以改成计数/间隔打印
         PRINT_E("get_and_process_fifo failed, rslt=%d\r\n", rslt);
     }
 }

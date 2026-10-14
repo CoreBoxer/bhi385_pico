@@ -12,6 +12,9 @@ int  pico_i2c_bridge_write(uint8_t dev_addr, uint8_t reg_addr, const uint8_t *da
 int  pico_i2c_bridge_read(uint8_t dev_addr, uint8_t reg_addr, uint8_t *data, uint32_t len);
 void pico_delay_us(uint32_t us);
 
+/* 新增：扫描总线上所有应答的7位地址，便于硬件排查 */
+void pico_i2c_bridge_scan(void);
+
 #ifdef __cplusplus
 }
 #endif

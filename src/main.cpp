@@ -1,17 +1,16 @@
 #include <Arduino.h>
+#include "bhi385_app.h"
 
-// the setup function runs once when you press reset or power the board
-void setup() {
-  // initialize digital pin LED_BUILTIN as an output.
-    pinMode(LED_BUILTIN, OUTPUT);
+void setup()
+{
     Serial.begin(115200);
+    while (!Serial) { delay(10); }
+    delay(500);
+    bhi385_app_init();
 }
 
-// the loop function runs over and over again forever
-void loop() {
-    Serial.println("bhi385_pico!");
-    digitalWrite(LED_BUILTIN, HIGH);  // turn the LED on (HIGH is the voltage level)
-    delay(500);                      // wait for a second
-    digitalWrite(LED_BUILTIN, LOW);   // turn the LED off by making the voltage LOW
-    delay(500);                      // wait for a second
+void loop()
+{
+    bhi385_app_loop();
+    delay(10);
 }

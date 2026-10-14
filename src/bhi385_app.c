@@ -150,7 +150,7 @@ void bhi385_app_init(void)
     uint16_t kernel_ver = 0;
 
     // 先用更低速确保信号完整性；稳定后再提到 400k/1MHz
-    pico_i2c_bridge_init(400000);
+    pico_i2c_bridge_init(1000000);
 
     // 1) 探测地址 + 读 chip id
     rslt = bhi385_probe_and_init(BHI385_ADDR_0);

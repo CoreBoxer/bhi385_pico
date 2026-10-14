@@ -10,8 +10,8 @@
 #include "bhi385_event_data.h"
 #include "bhi385_virtual_sensor_conf_param.h"
 
-/* 关键改动：换成带 BMP58X 驱动的固件，否则气压/温度虚拟传感器不会被枚举出来 */
-#include "firmware/bhi385/Bosch_Shuttle3_BHI385_BMP58X_bsxsam.fw.h"
+/* 切换为 ndof 固件：带 BMM350 磁力计驱动，才能枚举出 34 号 Rotation Vector */
+#include "firmware/bhi385/Bosch_Shuttle3_BHI385_BMM350_BMP58X_BME688_bsxsam_ndof.fw.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -34,6 +34,8 @@ static struct bhi385_dev bhy;
 static uint8_t dev_addr = BHI385_ADDR_0;
 static uint8_t work_buffer[WORK_BUFFER_SIZE];
 
+static bool pressure_first_sample_seen = false;
+
 static int8_t platform_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *intf_ptr)
 {
     uint8_t addr = *(uint8_t *)intf_ptr;
@@ -54,12 +56,12 @@ static void platform_delay_us(uint32_t period_us, void *intf_ptr)
     pico_delay_us(period_us);
 }
 
-/* ---------------- 四元数解析（保留，验证固件切换后 bsxsam 仍可用） ---------------- */
-static void parse_quaternion_data(const struct bhi385_fifo_parse_data_info *cb, void *ref)
+/* ---------------- 34号 Rotation Vector 解析：payload格式与 Game RV 完全一致 ---------------- */
+static void parse_rotation_vector_data(const struct bhi385_fifo_parse_data_info *cb, void *ref)
 {
     (void)ref;
 
-    if (cb->data_size != 11)
+    if (cb->data_size != 11) /* x,y,z,w(各2字节) + accuracy(2字节) + sensor_id(1字节) */
     {
         return;
     }
@@ -76,7 +78,7 @@ static void parse_quaternion_data(const struct bhi385_fifo_parse_data_info *cb, 
         ns = (uint32_t)(t - (uint64_t)s * UINT64_C(1000000000));
     }
 
-    PRINT_D("SID:%u T:%lu.%09lu x:%f y:%f z:%f w:%f acc:%0.2f\r\n",
+    PRINT_D("SID:%u(RV) T:%lu.%09lu x:%f y:%f z:%f w:%f acc:%0.2f\r\n",
             cb->sensor_id,
             (unsigned long)s, (unsigned long)ns,
             q.x / 16384.0f,
@@ -86,65 +88,49 @@ static void parse_quaternion_data(const struct bhi385_fifo_parse_data_info *cb, 
             ((q.accuracy * 180.0f) / 16384.0f) / 3.141592653589793f);
 }
 
-/* ---------------- 气压解析：3字节小端数据，缩放因子 1/128（单位 hPa） ---------------- */
+/* ---------------- 150号 气压：ndof固件同样存在，保留 ---------------- */
 static void parse_bmp_pressure_data(const struct bhi385_fifo_parse_data_info *cb, void *ref)
 {
     (void)ref;
 
-    if (!cb)
+    if (!cb || cb->data_size != 4) /* 3字节payload + 1字节sensor_id */
     {
-        PRINT_E("Pressure: Null reference\r\n");
         return;
     }
 
     const float scaling_factor = 1.0f / 128.0f;
-
-    uint32_t s = 0, ns = 0;
-    if (cb->time_stamp)
-    {
-        uint64_t timestamp = *cb->time_stamp;
-        timestamp = timestamp * 15625;
-        s  = (uint32_t)(timestamp / UINT64_C(1000000000));
-        ns = (uint32_t)(timestamp - (uint64_t)s * UINT64_C(1000000000));
-    }
-
     uint32_t data = BHI385_LE2U24(cb->data_ptr);
+    float pressure_pa = (float)data * scaling_factor; /* 单位是 Pa */
 
-    PRINT_D("SID:%u T:%lu.%09lu Pressure: %f hPa\r\n",
-            cb->sensor_id,
-            (unsigned long)s, (unsigned long)ns,
-            (float)data * scaling_factor);
-}
-
-/* ---------------- 温度解析：同样 3字节小端，缩放因子 1/128（单位 °C） ---------------- */
-static void parse_pressure_temperature_data(const struct bhi385_fifo_parse_data_info *cb, void *ref)
-{
-    (void)ref;
-
-    if (!cb)
+    if (!pressure_first_sample_seen)
     {
-        PRINT_E("Temperature: Null reference\r\n");
+        pressure_first_sample_seen = true;
+        PRINT_D("Pressure: discarding first sample after enable (raw=%f Pa)\r\n", pressure_pa);
         return;
     }
 
-    const float scaling_factor = 1.0f / 128.0f;
+    if (pressure_pa < 30000.0f || pressure_pa > 120000.0f)
+    {
+        PRINT_E("Pressure: out-of-range sample ignored (%f Pa)\r\n", pressure_pa);
+        return;
+    }
 
     uint32_t s = 0, ns = 0;
     if (cb->time_stamp)
     {
-        uint64_t timestamp = *cb->time_stamp;
-        timestamp = timestamp * 15625;
+        uint64_t timestamp = *cb->time_stamp * 15625;
         s  = (uint32_t)(timestamp / UINT64_C(1000000000));
         ns = (uint32_t)(timestamp - (uint64_t)s * UINT64_C(1000000000));
     }
 
-    uint32_t data = BHI385_LE2U24(cb->data_ptr);
-
-    PRINT_D("SID:%u T:%lu.%09lu Temperature: %f C\r\n",
-            cb->sensor_id,
-            (unsigned long)s, (unsigned long)ns,
-            (float)data * scaling_factor);
+    PRINT_D("SID:%u T:%lu.%09lu Pressure: %f Pa (%.2f hPa)\r\n",
+            cb->sensor_id, (unsigned long)s, (unsigned long)ns,
+            pressure_pa, pressure_pa / 100.0f);
 }
+
+/* 注：ndof固件里没有138号BMP Temperature，只有128号Temperature(来自BME688)，
+   payload格式大概率与BMP不同（位宽/缩放系数需另行确认），这里暂不注册，
+   避免"注册成功但收不到数据"的困惑。如需启用请先确认128号的实际数据格式。 */
 
 static int8_t bhi385_wait_host_if_ready(uint32_t timeout_ms, uint8_t *boot_status_out)
 {
@@ -213,7 +199,7 @@ void bhi385_app_init(void)
     uint8_t boot_status = 0;
     uint16_t kernel_ver = 0;
 
-    pico_i2c_bridge_init(1000000);
+    pico_i2c_bridge_init(1000000); /* 固件上传阶段用高速 */
 
     rslt = bhi385_probe_and_init(BHI385_ADDR_0);
     if (rslt != BHI385_OK)
@@ -251,7 +237,7 @@ void bhi385_app_init(void)
         if (rslt != BHI385_OK) { PRINT_E("set_host_intf_ctrl failed, rslt=%d\r\n", rslt); return; }
     }
 
-    PRINT_D("Uploading firmware (BMP58X + bsxsam)...\r\n");
+    PRINT_D("Uploading firmware (ndof: BMM350+BMP58X+BME688+bsxsam)...\r\n");
     rslt = bhi385_upload_firmware_to_ram(bhi385_firmware_image, sizeof(bhi385_firmware_image), &bhy);
     if (rslt != BHI385_OK)
     {
@@ -295,12 +281,11 @@ void bhi385_app_init(void)
         PRINT_E("Kernel version read failed or zero (rslt=%d, ver=%u)\r\n", rslt, kernel_ver);
     }
 
-    /* 注册回调：系统事件 + 四元数(可选保留) + 气压 + 温度 */
+    /* 注册回调：系统事件 + 34号Rotation Vector + 150号气压 */
     (void)bhi385_register_fifo_parse_callback(BHI385_SYS_ID_META_EVENT, bhi385_parse_meta_event, NULL, &bhy);
     (void)bhi385_register_fifo_parse_callback(BHI385_SYS_ID_META_EVENT_WU, bhi385_parse_meta_event, NULL, &bhy);
-    (void)bhi385_register_fifo_parse_callback(BHI385_SENSOR_ID_GAMERV, parse_quaternion_data, NULL, &bhy);
+    (void)bhi385_register_fifo_parse_callback(BHI385_SENSOR_ID_RV, parse_rotation_vector_data, NULL, &bhy);
     (void)bhi385_register_fifo_parse_callback(BHI385_SENSOR_ID_PRESSURE, parse_bmp_pressure_data, NULL, &bhy);
-    (void)bhi385_register_fifo_parse_callback(BHI385_SENSOR_BMP_TEMPERATURE, parse_pressure_temperature_data, NULL, &bhy);
 
     rslt = bhi385_update_virtual_sensor_list(&bhy);
     if (rslt != BHI385_OK)
@@ -312,26 +297,19 @@ void bhi385_app_init(void)
     struct bhi385_virtual_sensor_conf_param_conf sensor_conf;
     memset(&sensor_conf, 0, sizeof(sensor_conf));
 
-    /* Game Rotation Vector：如需关闭可删掉这3行以节省带宽/FIFO */
+    /* 34号 Rotation Vector：9轴融合，含绝对航向 */
     sensor_conf.sample_rate = 100.0f;
     sensor_conf.latency = 0;
-    rslt = bhi385_virtual_sensor_conf_param_set_cfg(BHI385_SENSOR_ID_GAMERV, &sensor_conf, &bhy);
-    if (rslt != BHI385_OK) { PRINT_E("Enable GAMERV failed, rslt=%d\r\n", rslt); }
-    else { PRINT_D("Game Rotation Vector enabled at %.2f Hz\r\n", sensor_conf.sample_rate); }
+    rslt = bhi385_virtual_sensor_conf_param_set_cfg(BHI385_SENSOR_ID_RV, &sensor_conf, &bhy);
+    if (rslt != BHI385_OK) { PRINT_E("Enable RV failed, rslt=%d\r\n", rslt); return; }
+    PRINT_D("Rotation Vector enabled at %.2f Hz\r\n", sensor_conf.sample_rate);
 
-    /* 气压：BMP58X 通常采样率上限较低，这里用 10Hz 示例，可按需调整 */
+    /* 150号 气压 */
     sensor_conf.sample_rate = 10.0f;
     sensor_conf.latency = 0;
     rslt = bhi385_virtual_sensor_conf_param_set_cfg(BHI385_SENSOR_ID_PRESSURE, &sensor_conf, &bhy);
     if (rslt != BHI385_OK) { PRINT_E("Enable PRESSURE failed, rslt=%d\r\n", rslt); return; }
     PRINT_D("Pressure enabled at %.2f Hz\r\n", sensor_conf.sample_rate);
-
-    /* 温度：通常跟随气压同一次测量产生，速率可与气压保持一致 */
-    sensor_conf.sample_rate = 10.0f;
-    sensor_conf.latency = 0;
-    rslt = bhi385_virtual_sensor_conf_param_set_cfg(BHI385_SENSOR_BMP_TEMPERATURE, &sensor_conf, &bhy);
-    if (rslt != BHI385_OK) { PRINT_E("Enable BMP_TEMPERATURE failed, rslt=%d\r\n", rslt); return; }
-    PRINT_D("BMP Temperature enabled at %.2f Hz\r\n", sensor_conf.sample_rate);
 }
 
 void bhi385_app_loop(void)

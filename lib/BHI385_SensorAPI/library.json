@@ -1,0 +1,21 @@
+{
+  "name": "BHI385_SensorAPI",
+  "version": "2.1.1",
+  "description": "Bosch BHI385 Sensor Hub SDK, vendored unmodified with auto path discovery",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/boschsensortec/BHI385_SensorAPI.git"
+  },
+  "frameworks": "*",
+  "platforms": "*",
+  "build": {
+    "extraScript": "extra_script.py",
+    "srcFilter": [
+      "-<*>",
+      "+<source/*.c>",
+      "+<source/**/*.c>",
+      "+<compat/*.c>",
+      "+<compat/*.cpp>"
+    ]
+  }
+}

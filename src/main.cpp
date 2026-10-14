@@ -12,5 +12,5 @@ void setup()
 void loop()
 {
     bhi385_app_loop();
-    delay(10);
+    // delay(10);
 }
